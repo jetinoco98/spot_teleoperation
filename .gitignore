@@ -1,0 +1,6 @@
+external/
+build/
+*.pyc
+.vscode/
+scripts/__pycache__/
+scripts/logs/

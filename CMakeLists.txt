@@ -1,0 +1,58 @@
+cmake_minimum_required(VERSION 3.15)
+project(spot_teleoperation LANGUAGES CXX)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+
+# System Libraries
+find_package(OpenGL REQUIRED)
+
+# OpenCV binaries stored on the project external folder
+set(OpenCV_DIR "${CMAKE_SOURCE_DIR}/external/opencv")
+find_package(OpenCV REQUIRED)
+set(OpenCV_LIB_DIRS "${CMAKE_SOURCE_DIR}/external/opencv/x64/vc16/lib")
+
+# Create a shared library target
+add_library(core_lib INTERFACE)
+
+# Include directories
+target_include_directories(core_lib INTERFACE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/external/zmq/include
+    ${CMAKE_SOURCE_DIR}/external/glew/include
+    ${CMAKE_SOURCE_DIR}/external/SDL2/include
+    ${CMAKE_SOURCE_DIR}/external/ovr_sdk/LibOVR/Include
+    ${CMAKE_SOURCE_DIR}/external/json
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+# Link directories
+target_link_directories(core_lib INTERFACE
+    ${CMAKE_SOURCE_DIR}/external/zmq/lib
+    ${CMAKE_SOURCE_DIR}/external/glew/lib/Release/x64
+    ${CMAKE_SOURCE_DIR}/external/SDL2/lib/x64
+    ${CMAKE_SOURCE_DIR}/external/ovr_sdk/LibOVR/Lib/Windows/x64/Release/VS2017
+    ${OpenCV_LIB_DIRS}
+)
+
+# Link libraries
+target_link_libraries(core_lib INTERFACE
+    libzmq-v143-mt-4_3_6
+    glew32
+    SDL2
+    OpenGL::GL
+    LibOVR
+    ${OpenCV_LIBS}
+)
+
+# Define the main executables
+set(CMAKE_WIN32_EXECUTABLE FALSE) # To ensure it's treated as a console application
+add_executable(${CMAKE_PROJECT_NAME} "src/main.cpp" "src/Shader.cpp" "src/OculusRenderer.cpp" "src/StreamCapture.cpp")
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE core_lib)
+
+# Copy DLL files to the output directory after build
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${PROJECT_SOURCE_DIR}/external/dlls"
+            "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>"
+)
