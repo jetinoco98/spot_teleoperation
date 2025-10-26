@@ -10,8 +10,6 @@
 """
 import logging
 import time
-import math
-import numpy as np
 import bosdyn.api.spot.robot_command_pb2 as spot_command_pb2
 import bosdyn.client
 from bosdyn.api import estop_pb2
@@ -57,28 +55,21 @@ class SpotInterface:
         self._actual_pitch = None
         self._actual_roll = None
         self._yaw_odom = None
-        self._pitch_odom = None
-        self._roll_odom = None
         self.is_initialized = False
         self.is_standing = False
         self.processed_state_data = {}
 
+        # Robot activity
+        self.last_movement_time = time.time()
+        self.inactivity_time = 0.0
+
         # SDK related
         self._estop_keepalive = None
 
-        # --- For KATVR integration
-        self.katvr_yaw_offset = 0.0
-        self.calibrated_with_katvr = False
-        self.target_yaw = None
-        self.base_hmd_height = None
-        self.autosit_active = False
-        # Autolook Mode
-        self.inactivity_time = 0
-        self.last_movement_time = time.time()
-        # PID Controller
-        self.set_up_pid_controller()
+    # ====================================================================================
+    #   METHODS FOR ROBOT INITIALIZATION AND SHUTDOWN
+    # ====================================================================================
 
-        
     def initialize(self):
         """ 
         Initializes SDK, authenticates, and ensures the required clients are available. 
@@ -99,10 +90,10 @@ class SpotInterface:
         self._power_client = self._robot.ensure_client(PowerClient.default_service_name)
         self._robot_state_client = self._robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = self._robot.ensure_client(RobotCommandClient.default_service_name)
-        self.start()
+        self._start()
         
 
-    def start(self):
+    def _start(self):
         """
         Takes the lease of the robot and powers on the motors
         """
@@ -161,6 +152,10 @@ class SpotInterface:
         print('SpotInterface shutdown complete.')
     
 
+    # ====================================================================================
+    #   LOW-LEVEL ROBOT COMMAND METHODS
+    # ====================================================================================
+
     def _set_mobility_params(self):
         """
         Sets the required mobility parameters, including obstacle avoidance, velocity limits, and orientation offset between the robot 
@@ -194,7 +189,7 @@ class SpotInterface:
 
     def _orientation_cmd_helper(self, yaw=0.0, roll=0.0, pitch=0.0, height=0.0):
         """
-        Helper function that commands the robot with an orientation command
+        Helper function that sends the robot an orientation command
             
         Args:
             yaw: Yaw of the robot body. Defaults to 0.0.
@@ -209,7 +204,7 @@ class SpotInterface:
 
     def _velocity_cmd_helper(self, v_x=0.0, v_y=0.0, v_rot=0.0):
         """
-        Helper function that commands the robot with a velocity command
+        Helper function that sends the robot a velocity command
 
         Args:
             v_x: Forward/backward velocity of the robot body.
@@ -221,47 +216,37 @@ class SpotInterface:
         self._robot_command_client.robot_command_async(command=cmd, end_time_secs=time.time() + VELOCITY_CMD_DURATION)
     
 
-    def get_body_orientation(self):
-        """
-        Provides the orientation values of the robot base frame.
-
-        Returns:
-            List[float]: A list containing the yaw, pitch, and roll angles of the robot's base frame,
-            in the following order: [yaw, pitch, roll].
-        """
-        
-        return [round(self._yaw, 3), round(self._pitch, 3), round(self._roll, 3)]
-
+    # ====================================================================================
+    #   HIGH-LEVEL ROBOT COMMAND METHODS
+    # ====================================================================================
     
     def stand(self):
         if not self.is_standing:
             blocking_stand(self._robot_command_client)
             self.is_standing = True
-            self.calibrated_with_katvr = False  # Reset calibration state
 
 
     def sit(self):
         if self.is_standing:
             blocking_sit(self._robot_command_client)
             self.is_standing = False
-            self.calibrated_with_katvr = False  # Reset calibration state
 
 
-    def set_idle_mode(self, height=0.0):
+    def stop(self, height=0.0):
         """
-        Sets the robot to idle mode by setting all velocities and orientations to zero.
+        Stops the robot by setting all velocities and orientations to zero, and sending the command.
         """
         self.set_orientation(0, 0, 0)
         self.set_velocity(0, 0, 0)
         self._orientation_cmd_helper(yaw=self._yaw, pitch=self._pitch, roll=self._roll, height=height)
-        self.calibrated_with_katvr = False
 
 
     def set_velocity(self, v_x: float, v_y: float, v_rot: float):
         """
-        Sets the robot's velocity values (body frame) based on the provided inputs.
+        Sets the robot's velocity values. It does NOT send the command to the robot.
 
-        Set a variable to None to keep the robot's current value unchanged.
+        Note:
+            Set a variable to `None` to keep the robot's current value unchanged.
 
         """
         if v_x is not None:
@@ -274,7 +259,7 @@ class SpotInterface:
 
     def set_orientation(self, yaw: float, pitch: float, roll: float):
         """
-        Updates the robot's orientation values (body frame) based on the HMD orientation.
+        Updates the robot's orientation values (body frame). It does NOT send the command to the robot.
         
         Set a variable to None to keep the robot's current value unchanged.
         """
@@ -288,7 +273,7 @@ class SpotInterface:
 
     def set_lqr_based_orientation(self, hmd_controls: list):
         """
-        Updates the robot's orientation values (body frame) based on the HMD orientation and LQR computation.
+        Updates the robot's orientation values (body frame) based on an LQR computation.
 
         Args:
             hmd_controls (list): A list containing the processed HMD control values in the order of [dyaw, dpitch, droll].
@@ -309,21 +294,6 @@ class SpotInterface:
         self._roll = max(-ROLL_MAX, min(ROLL_MAX, self._roll))
 
 
-    def set_touch_controls(self, touch_controls: list):
-        """
-        Updates the robot's velocity values (body frame) based on the HMD Touch Controller Joysticks.
-
-        Args:
-            touch_controls (list): A list containing the computed velocity control signals in the order of [v_x, v_y, v_rot].
-        """
-        self._v_x = touch_controls[0]
-        self._v_y = touch_controls[1]
-        self._v_rot = touch_controls[2]
-
-        if self._v_rot != 0:
-            self.calibrated_with_katvr = False  # Reset calibration state
-
-
     def set_height(self, direct_value: float = 0.0, joystick_value: float = 0.0):
         """
         Sets the height of the robot body frame with respect to the ground. 
@@ -335,7 +305,7 @@ class SpotInterface:
             joystick_value (float): Height adjustment value from a joystick input [-1, 1].
         """
         if joystick_value != 0.0 and abs(joystick_value) <= 1:
-            self._height = joystick_value * 0.25  # Adjust height based on joystick input
+            self._height = joystick_value * 0.15  # Adjust height based on joystick input
             return
         
         self._height = max(-0.15, min(0.15, direct_value))
@@ -343,12 +313,61 @@ class SpotInterface:
         
     def send_velocity_command(self):
         """
-        Sends a velocity command to the robot using its current velocity values.
+        Sends a velocity command to the robot using its (already set) velocity values. Additionally...
+
+        - Updates the robot's orientation based on the set Yaw, Pitch, and Roll values.
+        - Updates the robot's height.
         """
         self._velocity_cmd_helper(v_x=self._v_x, v_y=self._v_y, v_rot=self._v_rot)
 
+    
+    # ====================================================================================
+    #   METHODS FOR ROBOT STATE AND DATA RETRIEVAL
+    # ====================================================================================
 
-    def store_current_state(self):
+    def update_current_angles(self):
+        """
+        Calls the robot state client to update the robot's actual orientation values (odom/body_frame).
+        """
+        robot_state = self._robot_state_client.get_robot_state()
+        frame_tree_snapshot = robot_state.kinematic_state.transforms_snapshot
+
+        # ODOMETRY FRAME (Only yaw is needed)
+        odom_T_body = get_a_tform_b(frame_tree_snapshot, ODOM_FRAME_NAME, "feet_center")
+        quat = geometry.Quaternion(
+            w=odom_T_body.rot.w,
+            x=odom_T_body.rot.x,
+            y=odom_T_body.rot.y,
+            z=odom_T_body.rot.z
+        )
+        euler_odom = geometry.to_euler_zxy(quat)
+        self._yaw_odom = euler_odom.yaw
+
+        # BODY FRAME
+        odom_T_body = get_a_tform_b(frame_tree_snapshot, "feet_center", BODY_FRAME_NAME)
+        quat = geometry.Quaternion(
+            w=odom_T_body.rot.w,
+            x=odom_T_body.rot.x,
+            y=odom_T_body.rot.y,
+            z=odom_T_body.rot.z
+        )
+        euler_body = geometry.to_euler_zxy(quat)
+        self._actual_yaw = euler_body.yaw
+        self._actual_pitch = euler_body.pitch
+        self._actual_roll = euler_body.roll
+
+
+    def get_body_orientation(self):
+        """
+        Retrieves the desired orientation values for the robot's base frame. It is NOT the actual
+        orientation of the robot. However, under steady-state conditions, both values will be nearly equal.
+        Returns:
+            list: A three-element list containing orientation angles `[yaw, pitch, roll]` in radians.
+        """
+        return [self._yaw, self._pitch, self._roll]
+
+
+    def store_processed_state(self):
         """
         Stores the current robot data in a dictionary for later retrieval.
         """
@@ -362,161 +381,10 @@ class SpotInterface:
             'v_rot': self._v_rot,
             'is_standing': self.is_standing,
             'is_initialized': self.is_initialized,
-            'current_yaw': self._yaw_odom,
-            'required_yaw': self.target_yaw,
-            'orientation_yaw': self._actual_yaw,
+            'yaw_odom': self._yaw_odom,
         }
     
-    
+
     def get_data(self):
         """Returns a dictionary with the robot's most important data."""
         return self.processed_state_data
-
-    # ====================================================================================
-    #   METHODS FOR KATVR INTEGRATION
-    # ====================================================================================
-
-    def auto_sit_in_katvr(self, hmd_height, stand_button, height_threshold=0.18):
-        """
-        Makes the robot sit if the HDM height drops below a threshold.
-        """
-        if hmd_height is None or stand_button is None:
-            return
-        
-        if stand_button == 1.0:
-            self.base_hmd_height = hmd_height
-            return
-
-        if self.base_hmd_height is not None:
-            lower_limit = self.base_hmd_height - height_threshold
-
-            if hmd_height < lower_limit and self.is_standing:
-                self.sit()
-                self.autosit_active = True
-
-
-    def auto_stand_in_katvr(self, hmd_height):
-        """
-        Makes the robot stand automatically if the user stands up again after having sat down
-        and activated the auto-sit feature.
-        """
-        if hmd_height is None:
-            return
-
-        if not self.base_hmd_height:
-            return
-
-        if self.autosit_active and hmd_height >= self.base_hmd_height - 0.06:
-            self.autosit_active = False
-            self.stand()
-
-
-    def update_odometry_angles(self):
-        """
-        Updates the robot's angles in the odometry frame with respect to the ground.
-        """
-        robot_state = self._robot_state_client.get_robot_state()
-        frame_tree_snapshot = robot_state.kinematic_state.transforms_snapshot
-        odom_T_body = get_a_tform_b(frame_tree_snapshot, ODOM_FRAME_NAME, "feet_center")
-        quat = geometry.Quaternion(
-            w=odom_T_body.rot.w,
-            x=odom_T_body.rot.x,
-            y=odom_T_body.rot.y,
-            z=odom_T_body.rot.z
-        )
-        euler_odom = geometry.to_euler_zxy(quat)
-
-        self._yaw_odom = euler_odom.yaw
-        self._pitch_odom = euler_odom.pitch
-        self._roll_odom = euler_odom.roll
-
-        # TEMPORARY
-        odom_T_body = get_a_tform_b(frame_tree_snapshot, "feet_center", BODY_FRAME_NAME)
-        quat = geometry.Quaternion(
-            w=odom_T_body.rot.w,
-            x=odom_T_body.rot.x,
-            y=odom_T_body.rot.y,
-            z=odom_T_body.rot.z
-        )
-        euler_body = geometry.to_euler_zxy(quat)
-        self._actual_yaw = euler_body.yaw
-
-
-    @staticmethod
-    def normalize_angle(angle: float) -> float:
-        """
-        Normalizes an angle to the range [-pi, pi].
-        """
-        return (angle + np.pi) % (2 * np.pi) - np.pi
-    
-
-    def compute_angular_velocity_from_katvr(self, katvr_yaw):
-        self.update_odometry_angles()
-
-        if not self.calibrated_with_katvr:
-            self.katvr_yaw_offset = katvr_yaw - self._yaw_odom
-            self.calibrated_with_katvr = True
-            # Reset Yaw Error and Time
-            self.yaw_error = 0.0
-            self._prev_time = time.time()
-            return 0.0
-
-        # Compute calibrated yaw target for the robot
-        self.target_yaw = self.normalize_angle(katvr_yaw - self.katvr_yaw_offset)
-
-        # === PID Control ===
-        self.yaw_error = self.normalize_angle(self.target_yaw - self._yaw_odom)
-
-        # Set variables for PID control
-        Kp = self.pid_kp
-        Ki = 0.0  # Not used in this implementation
-        Kd = self.pid_kd
-
-        # Time step for derivative
-        now = time.time()
-        dt = now - self._prev_time
-        self._prev_time = now
-
-        # Derivative term
-        self.pid_d_error = (self.yaw_error - self._prev_yaw_error) / dt if dt > 0 else 0.0
-        self._prev_yaw_error = self.yaw_error
-
-        # Output calculation
-        self.pid_output = Kp * self.yaw_error + Kd * self.pid_d_error
-        self.pid_saturated_output = max(-ANGULAR_VEL_MAX, min(ANGULAR_VEL_MAX, self.pid_output))
-
-        # Dead zone logic
-        if abs(self.yaw_error) < abs(math.radians(self.pid_deadzone_degrees)):
-            self.pid_saturated_output = 0.0
-
-        self._v_rot = self.pid_saturated_output
-
-
-    # ====================================================================================
-    #   METHODS FOR CUSTOM PD CONTROLLER
-    # ====================================================================================
-
-    def set_up_pid_controller(self):
-        # Controller parameters
-        self.pid_kp = 2.0
-        self.pid_kd = 0.05
-        self.pid_deadzone_degrees = 2.0
-        # Controller state
-        self.yaw_error = 0.0
-        self.pid_d_error = 0.0
-        self.pid_output = 0.0
-        self.pid_saturated_output = 0.0
-        self._prev_yaw_error = 0.0
-        self._prev_time = time.time()
-
-
-    def update_pid_controller(self, kp=None, kd=None, dead_zone_degrees=None):
-        """
-        Update the PID controller parameters.
-        """
-        if kp is not None:
-            self.pid_kp = kp
-        if kd is not None:
-            self.pid_kd = kd
-        if dead_zone_degrees is not None and isinstance(dead_zone_degrees, (int, float)):
-            self.pid_deadzone_degrees = dead_zone_degrees

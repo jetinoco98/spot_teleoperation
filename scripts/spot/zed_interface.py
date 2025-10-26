@@ -1,7 +1,6 @@
 import threading
 import pyzed.sl as sl
 import cv2
-import time
 import argparse
 
 class ZEDInterface:
@@ -12,7 +11,8 @@ class ZEDInterface:
         '2k': {'resolution': sl.RESOLUTION.HD2K, 'fps': 15}       # HD2K: max 15 FPS
     }
     
-    def __init__(self, resolution='720'):
+    def __init__(self, resolution='720', stop_event=None):
+        self.stop_event = stop_event
         self.zed = sl.Camera()
         input_type = sl.InputType()
         init = sl.InitParameters(input_t=input_type)
@@ -30,7 +30,8 @@ class ZEDInterface:
             self.fps = 60
             
         init.depth_mode = sl.DEPTH_MODE.NONE
-        self.stop_event = threading.Event() # Event to signal termination
+        if not self.stop_event:
+            self.stop_event = threading.Event() # Create its own stop event if not provided
 
         err = self.zed.open(init)
         if err != sl.ERROR_CODE.SUCCESS:

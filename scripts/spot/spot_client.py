@@ -1,24 +1,19 @@
 #!/usr/bin/env python
 
 import argparse
-import math
 import paho.mqtt.client as mqtt
 import json
 import threading
 import time
+from typing import Callable
 from spot_interface import SpotInterface
 from zed_interface import ZEDInterface
-from input_controller import Controller
-    
-USE_LQR = False  # Use LQR for HDM controls
+from scripts.spot.input_controllers import HMDController, JoystickMapper, KatvrInterface, USE_LQR
+
 
 class SpotClient:
-    def __init__(self, broker_address):
-        self.stop_event = threading.Event()  # Event to signal termination
-        # Message frequency monitoring
-        self.message_count = 0
-        self.last_frequency_check = time.time()
-        self.all_frequency_samples = []  # Store ALL frequency samples for true average
+    def __init__(self, broker_address: str, stop_event: threading.Event):
+        self.stop_event = stop_event
         # MQTT related variables
         self.broker_address = broker_address
         self.sub_topic = "spot/inputs"
@@ -28,15 +23,15 @@ class SpotClient:
         self.client.on_message = self.on_message
         self.client.connect(self.broker_address, 1883)
         self.client.loop_start()
-        self.controller = Controller()   # Controller for HDM & Touch controls
+        self.hmd_controller = HMDController()   # Controller for HDM inputs
         # Variables to store and control inputs
         self.inputs = None
         self.inputs_last_message_time = 0
-        
-        # Initialize Spot robot interface
+        # Initialize Spot (robot) interface
         self.robot = SpotInterface()
         self.robot.initialize()
-
+        # Create KatVR interface instance
+        self.kat_interface = KatvrInterface(self.robot)
         # Start a thread to publish robot data at 10Hz
         threading.Thread(target=self.publish_data_loop, daemon=True).start()
     
@@ -45,7 +40,6 @@ class SpotClient:
         client.subscribe(self.sub_topic)
 
     def on_message(self, client, userdata, msg):
-        # === MESSAGES RECEIVED ON STANDARD CONTROLS ===
         if msg.topic == self.sub_topic:
             payload = msg.payload.decode()
             inputs = json.loads(payload)
@@ -54,187 +48,183 @@ class SpotClient:
                 return
             self.inputs = inputs
             self.inputs_last_message_time = time.time()
-            self.message_count += 1
         
     def publish_data_loop(self):
-        """Continuously publish robot data at 10Hz in a separate thread"""
-        interval = 1/10  # 10Hz
-        next_time = time.time()
-        
-        while not self.stop_event.is_set():
+        def task():
             try:
                 robot_data = self.robot.get_data()
                 payload = json.dumps(robot_data)
                 self.client.publish(self.pub_topic, payload)
             except Exception as e:
                 print(f"[SpotClient] Error publishing robot data: {e}")
-            
-            # Maintain fixed timing
-            next_time += interval
-            sleep_time = next_time - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                next_time = time.time()  # We're behind schedule; reset next_time
+
+        # Run the publishing task at 10Hz
+        run_at_fixed_rate(10, self.stop_event, task)
         
-    def process_inputs(self):
-        # Start/Stop commands
-        if self.inputs.get('start'):
+    def process_inputs(self, inputs: dict):
+        # --- START/STOP
+        if inputs.get('start'):
             self.robot.initialize()
-        elif self.inputs.get('shutdown'):
+            self.kat_interface.is_calibrated = False  # Reset calibration state
+        elif inputs.get('shutdown'):
             self.robot.shutdown()
 
-        # Stand/Sit commands
-        if self.inputs.get('stand'):
+        # --- STAND/SIT
+        if inputs.get('stand'):
             self.robot.stand()
-        elif self.inputs.get('sit'):
+        elif inputs.get('sit'):
             self.robot.sit()
 
-        # Special KATVR Auto Sit/Stand functionality
-        if self.inputs.get('source') == 'katvr':
-            self.robot.auto_sit_in_katvr(
-                self.inputs.get('hmd_height'),
-                self.inputs.get('stand')
+        # KATVR Auto Sit/Stand functionality
+        if inputs.get('source') == 'katvr':
+            self.kat_interface.auto_sit(
+                inputs.get('hmd_height'),
+                inputs.get('stand')
             )
-            self.robot.auto_stand_in_katvr(
-                self.inputs.get('hmd_height'),
+            self.kat_interface.auto_stand(
+                inputs.get('hmd_height'),
             )
 
         # Stop processing if the robot is not standing
         if not self.robot.is_standing:
             return
-        
-        # Set the robot's body frame YPR orientation
-        if USE_LQR: 
-            hmd_inputs = [
-                self.inputs.get('yaw'),        # HMD Yaw (radians)
-                self.inputs.get('pitch'),      # HMD Pitch (radians)
-                self.inputs.get('roll'),       # HMD Roll (radians)
-            ]
-            spot_measures = self.robot.get_body_orientation()
-            hmd_controls = self.controller.get_hmd_controls(hmd_inputs, spot_measures)
+
+        # --- ORIENTATION CONTROL
+        hmd_inputs = [
+            inputs.get('yaw'),        # HMD Yaw (radians)
+            inputs.get('pitch'),      # HMD Pitch (radians)
+            inputs.get('roll'),       # HMD Roll (radians)
+        ]
+        spot_measures = self.robot.get_body_orientation()
+        hmd_controls = self.hmd_controller.compute_controls(hmd_inputs, spot_measures)
+
+        if USE_LQR:
             self.robot.set_lqr_based_orientation(hmd_controls)
         else:
             self.robot.set_orientation(
-                yaw=self.inputs.get('yaw', 0.0), 
-                pitch=self.inputs.get('pitch', 0.0), 
-                roll=self.inputs.get('roll', 0.0)
+                yaw=hmd_controls[0],
+                pitch=hmd_controls[1],
+                roll=0
             )
         
-        # Set the robot's velocities based on KATVR data
-        if self.inputs.get('source') == 'katvr':
+        # --- VELOCITY CONTROL
+        if inputs.get('source') == 'katvr':
             self.robot.set_velocity(
-                    v_x=self.inputs.get('move_forward', 0.0),  # Direct velocity value (m/s)
-                    v_y=self.inputs.get('move_lateral', 0.0),  # Direct velocity value (m/s)
+                    v_x=inputs.get('move_forward', 0.0),  # Direct velocity value (m/s)
+                    v_y=inputs.get('move_lateral', 0.0),  # Direct velocity value (m/s)
                     v_rot=None,  # No direct rotation for KATVR
                 )
         else:
-            # Joystick inputs for velocity control
-            touch_inputs = [
-                self.inputs.get('move_forward', 0.0),   # Joystick value [-1,1]
-                self.inputs.get('move_lateral', 0.0),   # Joystick value [-1,1]
-                self.inputs.get('rotate', 0.0),         # Joystick value [-1,1]
+            joystick_inputs = [
+                inputs.get('move_forward', 0.0),   # Joystick value [-1,1]
+                inputs.get('move_lateral', 0.0),   # Joystick value [-1,1]
+                inputs.get('rotate', 0.0),         # Joystick value [-1,1]
             ]
-            touch_controls = self.controller.get_touch_controls(touch_inputs)
-            self.robot.set_touch_controls(touch_controls)
-
-        # Look Mode
-        if self.inputs.get('look_mode'):
+            velocities = JoystickMapper().compute_controls(joystick_inputs)
+            self.robot.set_velocity(
+                v_x=velocities[0],  # Forward/Backward
+                v_y=velocities[1],  # Left/Right
+                v_rot=velocities[2] # Rotation
+            )
+            
+        # --- MANUAL LOOK MODE: 
+        # Holds the robot in place and lets the user set the robot height using the joystick.
+        # ***Is activated while holding a trigger button.
+        if inputs.get('look_mode'):
             self.robot.set_velocity(0,0,0)  # Stop all movement when in Look Mode
             
-            if self.inputs.get('source') == 'katvr':
-                self.robot.calibrated_with_katvr = False  # Reset calibration state
-                self.robot.set_height(joystick_value=self.inputs.get('move_forward', 0.0))
+            if inputs.get('source') == 'katvr':
+                self.kat_interface.is_calibrated = False
+                self.robot.set_height(joystick_value=inputs.get('move_forward', 0.0))
 
-            elif self.inputs.get('source') == 'oculus':
-                self.robot.set_height(joystick_value=self.inputs.get('robot_height', 0.0))
+            elif inputs.get('source') == 'oculus':
+                self.robot.set_height(joystick_value=inputs.get('robot_height', 0.0))
         else:
             self.robot.set_height(direct_value=0.0)
 
-        # KATVR: Automatic Look Mode (PID Deadzone based adjustment)
-        if self.inputs.get('source') == 'katvr' and self.inputs.get('look_mode', False):
-            if abs(self.robot._v_x > 0) or abs(self.robot._v_y > 0) or abs(self.robot._v_rot > 0.05):
-                self.robot.last_movement_time = time.time()
-
-            self.robot.inactivity_time = time.time() - self.robot.last_movement_time
-            deadzone = 2.0  # Default deadzone for PID controller (degrees)
-
-            if not self.inputs.get('look_mode'):
-                range = 2  # Increase over 2 seconds of inactivity
-                inactivity_ratio = self.robot.inactivity_time / range
-                normalized_inactivity = max(0, min(inactivity_ratio, 1))
-                deadzone = 2 + 13 * normalized_inactivity  # Deadzone increases with inactivity for a max of 10°
-
-            self.robot.update_pid_controller(
-            dead_zone_degrees=deadzone,  # Deadzone for PID controller (degrees)
+        # KATVR: AUTOMATIC LOOK MODE (Requires dynamic PID deadzone adjustment)
+        if inputs.get('source') == 'katvr':
+            self.kat_interface.dynamic_deadzone_adjustment(
+                look_mode=inputs.get('look_mode', False)
             )
 
         # KATVR: Rotation based on KATVR yaw
-        if self.inputs.get('source') == 'katvr' and self.inputs.get('rotate', 0.0) == 0.0:
-            self.robot.compute_angular_velocity_from_katvr(
-                self.inputs.get('katvr_yaw', 0.0),
+        if inputs.get('source') == 'katvr' and inputs.get('rotate', 0.0) == 0.0:
+            self.kat_interface.compute_angular_velocity_from_katvr(
+                inputs.get('katvr_yaw', 0.0),
             )
 
-        # Robot height on PC GUI Controls
-        if self.inputs.get('source') == 'pc':
-            self.robot.set_height(joystick_value=self.inputs.get('robot_height', 0.0))
-
-        # Robot height on Game Controller
-        if self.inputs.get('source') == 'xbox':
-            self.robot.set_height(direct_value=self.inputs.get('robot_height', 0.0))
+        # ROBOT HEIGHT CONTROL. For non-immersive sources.
+        if inputs.get('source') == 'pc':
+            self.robot.set_height(joystick_value=inputs.get('robot_height', 0.0))
+        if inputs.get('source') == 'gamepad':
+            self.robot.set_height(direct_value=inputs.get('robot_height', 0.0))
 
         # === Send the command to the robot
-        # Note: This command will also set the robot's orientation and height.
+        # This command will also set the robot's orientation and height.
+        # The robot's body frame yaw will NOT change when the robot is moving.
         self.robot.send_velocity_command()
 
-
     def control_loop(self):
-        interval = 1.0 / 20  # 20Hz
-        next_time = time.time()
-
-        while not self.stop_event.is_set():
+        def task():
             time_diff = time.time() - self.inputs_last_message_time
 
+            # The inputs received are recent. Connection OK.
             if self.inputs and (time_diff < 1.0):
-                self.process_inputs()
+                self.process_inputs(self.inputs)
             else:
+                # Connection LOST. Stop the robot if it is standing.
                 if self.robot.is_standing:
-                    self.robot.set_idle_mode()
+                    self.robot.stop()
+            
+            # Store the current state for next iteration
+            self.robot.store_processed_state()
 
-            self.robot.store_current_state()  # Stores the current state of the robot just after processing inputs
+        run_at_fixed_rate(20, self.stop_event, task)
 
-            # Maintain fixed control loop timing
-            next_time += interval
-            sleep_time = next_time - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                next_time = time.time()  # We're behind schedule; reset next_time
-
-        # Cleanup on exit
+        # Cleanup after loop exits
         self.robot.shutdown()
-        self.client.loop_stop()
+        self.client.loop_stop() 
         self.client.disconnect()
         print("Spot Client disconnected.")
-        
 
+
+# --- Utility Functions ---
+def run_at_fixed_rate(rate_hz: float, stop_event: threading.Event, task: Callable[[], None]):
+    """Runs `task()` repeatedly at `rate_hz` until stop_event is set."""
+    interval = 1.0 / rate_hz
+    next_time = time.monotonic()
+    while not stop_event.is_set():
+        # Execute the function
+        task()
+        # Maintain fixed timing
+        next_time += interval
+        sleep_time = next_time - time.monotonic()
+        if sleep_time > 0:
+            stop_event.wait(timeout=sleep_time)
+        else:
+            next_time = time.monotonic()
+
+
+### --- Main Program ---
 def main(broker_address, no_zed=False):
+    """
+    Initializes the MQTT client and the Spot SDK, and the ZED camera in a separate thread (if not disabled).
+    """
     stop_event = threading.Event()
     
     # Initialize Spot client
-    spot = SpotClient(broker_address)
-    spot.stop_event = stop_event
+    spot = SpotClient(broker_address, stop_event)
     
-    # Conditionally initialize ZED client
+    # Initialize ZED client
     zed = None
     zed_thread = None
     if not no_zed:
-        zed = ZEDInterface()
-        zed.stop_event = stop_event
+        zed = ZEDInterface(stop_event=stop_event)
         zed_thread = threading.Thread(target=zed.start_streaming, args=(broker_address,))
         zed_thread.start()
     else:
-        print("ZED camera disabled with --no-zed argument")
+        print("ZED camera initialization disabled with --no-zed argument")
     
     # Start Spot control loop
     spot_thread = threading.Thread(target=spot.control_loop)

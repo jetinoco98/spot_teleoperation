@@ -576,7 +576,7 @@ class VideoDisplayBlock(BaseBlock):
                         print(f"[GUI] [VideoDisplayBlock] Starting stream for {current_source} control source")
                         self.start_stream()
                 else:
-                    # Stop streaming for all other sources (OCULUS, KATVR, XBOX)
+                    # Stop streaming for all other sources (OCULUS, KATVR, GAMEPAD)
                     if self.is_streaming or (self.thread is not None and self.thread.is_alive()):
                         print(f"[GUI] [VideoDisplayBlock] Stopping stream for {current_source} control source")
                         self.stop_stream()
@@ -1267,13 +1267,13 @@ class JoystickV2Block(BaseBlock):
 
 class ControlSourceBlock(BaseBlock):
     """
-    A 4x1 Tkinter block that allows users to select a control source (PC, OCULUS, KATVR, XBOX) using buttons.
+    A 4x1 Tkinter block that allows users to select a control source (PC, OCULUS, KATVR, GAME) using buttons.
     It supports keyboard shortcuts (1, 2, 3, 4) for quick selection.
     """
     def __init__(self, app, name: str = "Source"):
         super().__init__(app, width_units=3, height_units=1)
         self.name = name
-        self.sources = ["PC", "OCULUS", "KATVR", "XBOX"]
+        self.sources = ["PC", "OCULUS", "KATVR", "GAME"]
         self.active_index = 0
         self.state = {src: (i == self.active_index) for i, src in enumerate(self.sources)}
         self.buttons = {}
@@ -1465,202 +1465,6 @@ class CommandControlBlock(BaseBlock):
         Keys are command names, values are booleans.
         """
         return dict(self.state)
-
-class PIDGraphBlock(BaseBlock):
-    MAX_POINTS = 100
-
-    def __init__(self, app):
-        super().__init__(app, width_units=5, height_units=3)
-        self.required_yaw_values = []
-        self.current_yaw_values = []
-        self.required_yaw_loops = 0
-        self.current_yaw_loops = 0
-        self.last_required_yaw = None
-        self.last_current_yaw = None
-        self.time_step = 0
-        self.active = False
-
-    @staticmethod
-    def normalize_angle(angle):
-        while angle >= math.pi:
-            angle -= 2 * math.pi
-        while angle < -math.pi:
-            angle += 2 * math.pi
-        return angle
-
-    def build(self, container, width_px, height_px):
-        self.container = container
-        self.canvas_width = width_px
-        self.canvas_height = height_px
-
-        style = self.app.style
-        self.padding_px = style.scaled_size(0.04)  # Increased padding to 4%
-        self.offset_small = style.scaled_size(0.005)
-        self.label_height_px = style.scaled_size(0.025)
-
-        self.font_small = ("TkDefaultFont", style.font_size("small"))
-        self.font_normal = ("TkDefaultFont", style.font_size("normal"))
-        self.font_large = ("TkDefaultFont", style.font_size("large"))
-
-        self.title_label = tk.Label(
-            container,
-            text="SPOT-KATVR PID Response",
-            bg="gray",
-            fg="white",
-            font=self.font_large
-        )
-        self.title_label.pack(fill="x")
-
-        self.canvas = tk.Canvas(
-            container,
-            bg="white",
-            width=width_px,
-            height=height_px - self.label_height_px
-        )
-        self.canvas.pack()
-
-        self.schedule_periodic_update(50, self.periodic_update)
-
-    def get_tiled_yaw(self, current, previous, prev_loop_count):
-        if previous is None:
-            return 0, current
-        delta = current - previous
-        if delta > math.pi:
-            prev_loop_count -= 1
-        elif delta < -math.pi:
-            prev_loop_count += 1
-        full_angle = prev_loop_count * 2 * math.pi + current
-        return prev_loop_count, full_angle
-
-    def update_yaw(self, required_yaw, current_yaw, active=False):
-        self.active = active
-        if not self.active:
-            return
-
-        required_yaw = self.normalize_angle(required_yaw)
-        current_yaw = self.normalize_angle(current_yaw)
-
-        if self.time_step == 0:
-            r_loops, r_full = 0, required_yaw
-            c_loops, c_full = 0, current_yaw
-        else:
-            r_loops, r_full = self.get_tiled_yaw(required_yaw, self.last_required_yaw, self.required_yaw_loops)
-            c_loops, c_full = self.get_tiled_yaw(current_yaw, self.last_current_yaw, self.current_yaw_loops)
-
-        self.required_yaw_values.append(r_full)
-        self.current_yaw_values.append(c_full)
-
-        self.required_yaw_loops = r_loops
-        self.current_yaw_loops = c_loops
-        self.last_required_yaw = required_yaw
-        self.last_current_yaw = current_yaw
-
-        if len(self.required_yaw_values) > self.MAX_POINTS:
-            self.required_yaw_values.pop(0)
-            self.current_yaw_values.pop(0)
-
-    def periodic_update(self):
-        spot_data = self.app.data_manager.spot.data
-        if spot_data and "required_yaw" in spot_data and "current_yaw" in spot_data:
-            required_yaw = spot_data.get("required_yaw", 0.0)
-            current_yaw = spot_data.get("current_yaw", 0.0)
-            if required_yaw is not None and current_yaw is not None:
-                self.update_yaw(required_yaw, current_yaw, active=True)
-        else:
-            self.active = False
-        self.draw_graph()
-        self.time_step += 1
-
-    def draw_graph(self):
-        self.canvas.delete("all")
-
-        if not self.active:
-            self.canvas.create_text(
-                self.canvas_width // 2,
-                self.canvas_height // 2 - 15,
-                text="ⓘ Not in use",
-                font=self.font_large,
-                fill="gray",
-                anchor="center"
-            )
-            return
-
-        if not self.required_yaw_values or not self.current_yaw_values:
-            return
-
-        all_values = self.required_yaw_values + self.current_yaw_values
-        min_y = min(all_values)
-        max_y = max(all_values)
-
-        # Fix 2: Adjust zoom for steady state
-        yaw_range = max(max_y - min_y, 0.1) # Ensure a minimum range
-        min_margin_radians = math.pi / 4 # Fixed minimum margin (e.g., pi/4 radians)
-        
-        # Calculate dynamic margin, but ensure it's at least min_margin_radians
-        margin = max(yaw_range * 0.1, min_margin_radians) 
-        
-        min_y -= margin
-        max_y += margin
-
-        scale_y = (self.canvas_height - 2 * self.padding_px) / (max_y - min_y)
-        scale_x = (self.canvas_width - 2 * self.padding_px) / self.MAX_POINTS
-
-        # Grid lines for multiples of pi
-        tile_height = 2 * math.pi
-        tile_start = math.floor(min_y / tile_height) - 1
-        tile_end = math.ceil(max_y / tile_height) + 1
-
-        # Fix 3: Increase amount of angle values shown in the y-axis
-        # Added more fractional pi values
-        angle_fractions = [
-            (0.0, "0"),
-        ]
-
-        for t in range(tile_start, tile_end + 1):
-            base = t * tile_height
-            for frac, label in angle_fractions:
-                val = base + frac * tile_height
-                # Only draw if the value is within the current visible range
-                if min_y <= val <= max_y:
-                    y = self.get_canvas_y(val, min_y, scale_y)
-                    self.canvas.create_line(self.padding_px, y, self.canvas_width - self.padding_px, y, fill="#eee")
-                    self.canvas.create_text(self.padding_px - self.offset_small, y, text=label, anchor="e", font=self.font_small)
-
-        # X axis lines
-        for i in range(0, self.MAX_POINTS, 20):
-            x = self.get_canvas_x(i)
-            self.canvas.create_line(x, self.padding_px, x, self.canvas_height - self.padding_px, fill="#f5f5f5")
-            self.canvas.create_text(x, self.canvas_height - self.padding_px + self.offset_small, text=str(i), anchor="n", font=self.font_small)
-
-        # Main axes
-        y0 = self.get_canvas_y(0, min_y, scale_y)
-        self.canvas.create_line(self.padding_px, y0, self.canvas_width - self.padding_px, y0, fill="gray")
-        self.canvas.create_line(self.padding_px, self.padding_px, self.padding_px, self.canvas_height - self.padding_px, fill="gray")
-
-        # Axis labels
-        self.canvas.create_text(self.canvas_width // 2, self.canvas_height - 50,
-                                 text="Time (steps)", font=self.font_normal)
-        self.canvas.create_text(10, self.canvas_height // 2,
-                                 text="Yaw (rad)", angle=90, font=self.font_normal)
-
-        # Data lines
-        self.draw_line(self.required_yaw_values, "blue", min_y, scale_y)
-        self.draw_line(self.current_yaw_values, "red", min_y, scale_y)
-
-    def draw_line(self, data, color, min_y, scale_y):
-        for i in range(1, len(data)):
-            x1 = self.get_canvas_x(i - 1)
-            x2 = self.get_canvas_x(i)
-            y1 = self.get_canvas_y(data[i - 1], min_y, scale_y)
-            y2 = self.get_canvas_y(data[i], min_y, scale_y)
-            self.canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
-
-    def get_canvas_x(self, index):
-        return self.padding_px + index * (self.canvas_width - 2 * self.padding_px) / self.MAX_POINTS
-
-    def get_canvas_y(self, value, min_y, scale_y):
-        # Y-axis is inverted in canvas, so subtract from height
-        return self.canvas_height - self.padding_px - (value - min_y) * scale_y
 
 class DynamicDictBlock(BaseBlock):
     def __init__(self, app: ModularGUI, title: str, data_fn: callable, update_rate_ms=100):
@@ -1884,4 +1688,39 @@ class SwappableBlock(BaseBlock):
         for block in self.blocks:
             block.destroy()
         super().destroy()
+
+class ExpansionZoneBlock(BaseBlock):
+    """
+    A 5x3 block displaying "EXPANSION ZONE" text in the center.
+    This block serves as a placeholder for future functionality.
+    """
+    def __init__(self, app, name: str = "ExpansionZone"):
+        super().__init__(app, width_units=5, height_units=3)
+        self.name = name
+
+    def build(self, container, width_px, height_px):
+        super().build(container, width_px, height_px)
+        container.configure(bg="#1e1e1e")
+        
+        font_size = self.style.font_size("large")
+        
+        # Title bar with similar styling
+        title = tk.Label(
+            container, 
+            text="EXPANSION ZONE", 
+            bg="#223344", 
+            fg="white", 
+            font=("TkDefaultFont", font_size, "bold")
+        )
+        title.place(relx=0, rely=0, relwidth=1.0, relheight=0.15)
+        
+        # Center text
+        center_label = tk.Label(
+            container,
+            text="Add more functionality here",
+            bg="#1e1e1e",
+            fg="white",
+            font=("TkDefaultFont", font_size, "bold")
+        )
+        center_label.place(relx=0.5, rely=0.5, anchor="center")
 

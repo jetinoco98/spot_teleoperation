@@ -6,7 +6,7 @@ class Commands:
         self.sit = False
         self.stand = False
 
-class XboxController:
+class GameController:
     DEADZONE = 0.25  # Thumbstick deadzone
 
     # Button mappings (for Xbox controller)
@@ -238,7 +238,7 @@ class XboxController:
 
 if __name__ == "__main__":
     try:
-        controller = XboxController()
+        controller = GameController()
         while True:
             data = controller.get_data()  # Continuously get data
             

@@ -33,7 +33,7 @@ def main(broker_address):
     app.add_block(JoystickV2Block(app), grid_x=6, grid_y=6)
     app.add_block(ControlSourceBlock(app), grid_x=8, grid_y=8)
     app.add_block(CommandControlBlock(app), grid_x=8, grid_y=6)
-    app.add_block(PIDGraphBlock(app), grid_x=11, grid_y=6)
+    app.add_block(ExpansionZoneBlock(app), grid_x=11, grid_y=6)
     
     # --- Start the GUI main loop
     app.mainloop()  # This blocks until the GUI window is closed

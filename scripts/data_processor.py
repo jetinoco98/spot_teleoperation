@@ -77,7 +77,7 @@ class KatvrDataProcessor:
         self.velocity = 0
         self.velocity_filtered_light = 0
         self.previous_velocity_filtered_light = 0
-        self.velocity_history_light = collections.deque(maxlen=7)
+        self.velocity_history_light = collections.deque(maxlen=5) # For moving median filter
         self.is_movement_detected = False
 
         # Median filter activation tracking
@@ -87,7 +87,7 @@ class KatvrDataProcessor:
 
         # KATVR velocity tracking (EMA)
         self.velocity_filtered_strong = 0
-        self.ema_alpha = 0.6
+        self.ema_alpha = 0.4
 
         # Output velocity components
         self.output_velocity = 0
@@ -176,9 +176,8 @@ class KatvrDataProcessor:
 
     def _process_velocity(self):
         """
-        Applies moving median filter and EMA to the raw velocity and updates the internal variables:
-        `velocity_filtered_light`, `velocity_filtered_strong`, and `is_movement_detected`.
-        Also computes the output forward velocity based on the selected mode.
+        - Applies moving median filter and EMA to the raw velocity and updates the internal variables.
+        - Also computes the output forward velocity based on the selected mode.
         """
         if self.on_debounce:
             self.is_movement_detected = False  # Reset movement detection during debounce
@@ -221,7 +220,7 @@ class KatvrDataProcessor:
             self.median_filter_active = False
             self.movement_count_since_detected = 0
 
-        # 5. Apply EMA filter (alpha = 0.6) that gets values from median filter output
+        # 5. Apply EMA filter that gets values from median filter output
         if self.median_filter_active:
             # EMA: new_value = alpha * current_input + (1 - alpha) * previous_value
             self.velocity_filtered_strong = (self.ema_alpha * self.velocity_filtered_light + 

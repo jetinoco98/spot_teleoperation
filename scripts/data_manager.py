@@ -10,9 +10,9 @@ import csv
 from datetime import datetime
 import paho.mqtt.client as mqtt
 from data_processor import KatvrDataProcessor
-from xbox import XboxController
+from gamepad import GameController
 from config import UDP_IP, UDP_PORT
-from config import ZMQ_IP, ZMQ_PORT, ZMQ_SUB_TOPIC
+from config import ZMQ_PORT, ZMQ_SUB_TOPIC
 from config import LOG_KATVR_DATA
 
 
@@ -21,10 +21,13 @@ class DataManager:
     def __init__(self, broker_address: str):
         self.oculus = OculusHandler()
         self.katvr = KatvrHandler(KatvrDataProcessor(), self.oculus)
-        self.xbox = XboxHandler()
+        self.game = GamepadHandler()
         self.gui = GUIHandler()
         self.spot = SpotHandler(self, broker_address=broker_address)
         self.monitor = ActivityMonitor(self.oculus, self.katvr, self.spot)
+
+    def get_inputs(self):
+        return InputBuilder.build(self.gui, self.oculus, self.katvr, self.game)
 
     def start(self):
         self.oculus.start()
@@ -52,10 +55,7 @@ class DataManager:
         if self.gui.commands.get("Calibrate: HMD+KATVR"):
             self.katvr.calibrate_yaw()
 
-    def get_inputs(self):
-        return InputBuilder.build(self.gui, self.oculus, self.katvr, self.xbox)
-
-
+    
 # ====================== OCULUS HANDLER ======================
 class OculusHandler:
     """
@@ -267,15 +267,15 @@ class GUIHandler:
         return self.data.get("Commands", {})
     
 
-# ====================== XBOX HANDLER ======================
-class XboxHandler:
+# ====================== GAMEPAD HANDLER ======================
+class GamepadHandler:
     def __init__(self):
         self.controller = None
 
     def start(self):
         if not self.controller:
             try:
-                self.controller = XboxController()
+                self.controller = GameController()
             except Exception as e:
                 self.controller = None
 
@@ -283,6 +283,7 @@ class XboxHandler:
         if self.controller:
             self.controller.close()
         self.controller = None
+
 
 # ====================== SPOT HANDLER ======================
 class SpotHandler:
@@ -392,15 +393,15 @@ class InputBuilder:
     Use the `build()` method to create a dictionary of inputs to be sent to the SPOT Client.
     """
     @staticmethod
-    def build(gui: GUIHandler, oculus: OculusHandler, katvr: KatvrHandler, xbox: XboxHandler):
+    def build(gui: GUIHandler, oculus: OculusHandler, katvr: KatvrHandler, game: GamepadHandler):
         """
-        Builds a dictionary of inputs based on the current state of the GUI, Oculus, KatVR, and Xbox.
+        Builds a dictionary of inputs based on the current state of the GUI, Oculus, KatVR, and Gamepad.
 
         The created inputs depend on the source of the data:
         - If the source is `OCULUS`, it uses Oculus data.
         - If the source is `KATVR`, it combines Oculus and KatVR data.
         - If the source is `PC`, it uses GUI joystick inputs. 
-        - If the source is `XBOX`, it uses Game controller data.
+        - If the source is `GAME`, it uses Game controller data.
         """
         def normalize_angle(angle):
             return (angle + math.pi) % (math.pi * 2) - math.pi
@@ -468,24 +469,24 @@ class InputBuilder:
                 'robot_height': gui.right_joystick.get("y", 0.0),
             }
         
-        elif gui.source() == "XBOX":
-            xbox.start()
-            if xbox.controller:
-                xbox_data = xbox.controller.get_data()
+        elif gui.source() == "GAME":
+            game.start()
+            if game.controller:
+                data = game.controller.get_data()
                 data = {
-                    'source': 'xbox',
-                    'yaw': xbox_data.get('yaw', 0.0),
-                    'pitch': xbox_data.get('pitch', 0.0),
-                    'move_forward': xbox_data.get('v_x', 0.0),
-                    'move_lateral': xbox_data.get('v_y', 0.0),
-                    'rotate': xbox_data.get('v_rot', 0.0),
-                    'stand': xbox_data.get('stand_cmd', False) or gui.commands.get("Stand", False),
-                    'sit': xbox_data.get('sit_cmd', False) or gui.commands.get("Sit", False),
-                    'robot_height': xbox_data.get('height', 0.0)
+                    'source': 'gamepad',
+                    'yaw': data.get('yaw', 0.0),
+                    'pitch': data.get('pitch', 0.0),
+                    'move_forward': data.get('v_x', 0.0),
+                    'move_lateral': data.get('v_y', 0.0),
+                    'rotate': data.get('v_rot', 0.0),
+                    'stand': data.get('stand_cmd', False) or gui.commands.get("Stand", False),
+                    'sit': data.get('sit_cmd', False) or gui.commands.get("Sit", False),
+                    'robot_height': data.get('height', 0.0)
                 }
 
-        if gui.source() != "XBOX":
-            xbox.stop()  
+        if gui.source() != "GAME":
+            game.stop()
 
         return data
 
